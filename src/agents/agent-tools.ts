@@ -387,6 +387,8 @@ export function createOpenClawCodingTools(options?: {
   messageProvider?: string;
   /** Canonical transport channel when tool-policy provider differs from delivery channel. */
   messageChannel?: string;
+  /** Capabilities declared by the gateway client that originated this run. */
+  clientCaps?: string[];
   /** Normalized conversation kind when the caller already has channel metadata. */
   chatType?: ChatType;
   /** Specific ingress provider used only for transport tool availability. */
@@ -1002,6 +1004,7 @@ export function createOpenClawCodingTools(options?: {
           spawnWorkspaceDir: capabilityProfile.workspace.spawnWorkspaceRoot,
           sandboxed: Boolean(sandbox),
           config: options?.config,
+          clientCaps: options?.clientCaps,
           pluginToolAllowlist,
           pluginToolDenylist,
           cronCreatorToolAllowlist: shouldCaptureCronCreatorToolAllowlist

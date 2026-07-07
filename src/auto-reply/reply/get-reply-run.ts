@@ -1477,6 +1477,7 @@ export async function runPreparedReply(
       sessionKey,
       runtimePolicySessionKey,
       messageProvider,
+      clientCaps: ctx.GatewayClientCaps,
       chatType: replyRoute.chatType,
       agentAccountId: replyRoute.accountId,
       groupId: resolveGroupSessionKey(sessionCtx)?.id ?? undefined,
