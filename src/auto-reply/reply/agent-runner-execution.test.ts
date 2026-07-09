@@ -471,6 +471,8 @@ function createMockReplyOperation(): {
       result: null,
       hasOwnedSessionId: vi.fn((sessionId: string) => sessionId === "session"),
       setPhase: vi.fn(),
+      markWaitingForDeferredMaintenance: vi.fn(),
+      markDeferredMaintenanceWaitEnded: vi.fn(),
       updateSessionId: updateSessionIdMock,
       attachBackend: vi.fn(),
       detachBackend: vi.fn(),

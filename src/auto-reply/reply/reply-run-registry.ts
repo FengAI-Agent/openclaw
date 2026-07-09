@@ -5,10 +5,7 @@ import {
   isAgentRunRestartAbortReason,
 } from "../../agents/run-termination.js";
 import { createAbortError } from "../../infra/abort-signal.js";
-import {
-  markDiagnosticEmbeddedRunEnded,
-  markDiagnosticEmbeddedRunStarted,
-} from "../../logging/diagnostic-run-activity.js";
+import { markDiagnosticRunProgress } from "../../logging/diagnostic-run-activity.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { resolveTimerTimeoutMs } from "../../shared/number-coercion.js";
@@ -47,6 +44,7 @@ export type ReplyBackendHandle = {
 
 export type ReplyOperationPhase =
   | "queued"
+  | "waiting_for_deferred_maintenance"
   | "preflight_compacting"
   | "memory_flushing"
   | "running"
@@ -90,7 +88,18 @@ export type ReplyOperation = {
   readonly result: ReplyOperationResult | null;
   /** True when this operation has owned the supplied session ID. */
   hasOwnedSessionId(sessionId: string): boolean;
-  setPhase(next: "queued" | "preflight_compacting" | "memory_flushing" | "running"): void;
+  setPhase(
+    next:
+      | "queued"
+      | "waiting_for_deferred_maintenance"
+      | "preflight_compacting"
+      | "memory_flushing"
+      | "running",
+  ): void;
+  /** Mark this operation as waiting on prior same-session maintenance. */
+  markWaitingForDeferredMaintenance(): void;
+  /** Return a maintenance-waiting operation to queued if the run has not started. */
+  markDeferredMaintenanceWaitEnded(): void;
   /** Mark this operation as an in-flight terminal-session recovery. */
   markTerminalRecovery(): void;
   markAcceptedSteeredInboundAudio(): void;
@@ -249,6 +258,10 @@ function isReplyRunCompacting(operation: ReplyOperation): boolean {
   }
   const backend = getAttachedBackend(operation);
   return backend?.isCompacting?.() ?? false;
+}
+
+function isReplyOperationPreBackendPhase(phase: ReplyOperationPhase): boolean {
+  return phase === "queued" || phase === "waiting_for_deferred_maintenance";
 }
 
 const attachedBackendByOperation = new WeakMap<ReplyOperation, ReplyBackendHandle>();
@@ -413,27 +426,15 @@ function clearReplyRunState(params: { sessionKey: string; sessionId: string }): 
   notifyReplyRunEnded(params.sessionKey);
 }
 
-function replyRunDiagnosticWorkKey(sessionKey: string): string {
-  return `reply:${sessionKey}`;
-}
-
-function markReplyRunDiagnosticWorkStarted(params: {
+function markReplyRunDiagnosticProgress(params: {
   sessionKey: string;
   sessionId: string;
+  reason: string;
 }): void {
-  markDiagnosticEmbeddedRunStarted({
+  markDiagnosticRunProgress({
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
-    workKey: replyRunDiagnosticWorkKey(params.sessionKey),
-  });
-}
-
-function markReplyRunDiagnosticWorkEnded(params: { sessionKey: string; sessionId: string }): void {
-  markDiagnosticEmbeddedRunEnded({
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    workKey: replyRunDiagnosticWorkKey(params.sessionKey),
-    clearRunActivity: false,
+    reason: params.reason,
   });
 }
 
@@ -500,7 +501,11 @@ export function createReplyOperation(params: {
         )
       : undefined;
     updateFollowupAdmissionSessionId(sessionKey, currentSessionId);
-    markReplyRunDiagnosticWorkEnded({ sessionKey, sessionId: currentSessionId });
+    markReplyRunDiagnosticProgress({
+      sessionKey,
+      sessionId: currentSessionId,
+      reason: "reply_operation:ended",
+    });
     clearReplyRunState({
       sessionKey,
       sessionId: currentSessionId,
@@ -572,6 +577,28 @@ export function createReplyOperation(params: {
       }
       phase = next;
     },
+    markWaitingForDeferredMaintenance() {
+      if (result || phase !== "queued") {
+        return;
+      }
+      phase = "waiting_for_deferred_maintenance";
+      markReplyRunDiagnosticProgress({
+        sessionKey,
+        sessionId: currentSessionId,
+        reason: "deferred_maintenance:waiting",
+      });
+    },
+    markDeferredMaintenanceWaitEnded() {
+      if (result || phase !== "waiting_for_deferred_maintenance") {
+        return;
+      }
+      phase = "queued";
+      markReplyRunDiagnosticProgress({
+        sessionKey,
+        sessionId: currentSessionId,
+        reason: "deferred_maintenance:wait_ended",
+      });
+    },
     markTerminalRecovery() {
       terminalRecovery = true;
     },
@@ -602,7 +629,11 @@ export function createReplyOperation(params: {
       replyRunState.activeSessionIdsByKey.set(sessionKey, currentSessionId);
       replyRunState.activeKeysBySessionId.set(currentSessionId, sessionKey);
       registerWaitSessionId(sessionKey, currentSessionId);
-      markReplyRunDiagnosticWorkStarted({ sessionKey, sessionId: currentSessionId });
+      markReplyRunDiagnosticProgress({
+        sessionKey,
+        sessionId: currentSessionId,
+        reason: "reply_operation:session_updated",
+      });
     },
     attachBackend(handle) {
       if (result) {
@@ -669,7 +700,10 @@ export function createReplyOperation(params: {
       abortWithReason("user_abort", createUserAbortError(), {
         abortedCode: "aborted_by_user",
       });
-      if (phaseBeforeAbort === "queued" && !retainStateUntilCompleteOperations.has(operation)) {
+      if (
+        isReplyOperationPreBackendPhase(phaseBeforeAbort) &&
+        !retainStateUntilCompleteOperations.has(operation)
+      ) {
         clearState();
       }
       return true;
@@ -682,7 +716,10 @@ export function createReplyOperation(params: {
       abortWithReason("restart", createAgentRunRestartAbortError(), {
         abortedCode: "aborted_for_restart",
       });
-      if (phaseBeforeAbort === "queued" && !retainStateUntilCompleteOperations.has(operation)) {
+      if (
+        isReplyOperationPreBackendPhase(phaseBeforeAbort) &&
+        !retainStateUntilCompleteOperations.has(operation)
+      ) {
         clearState();
       }
       return true;
@@ -693,7 +730,11 @@ export function createReplyOperation(params: {
   replyRunState.activeSessionIdsByKey.set(sessionKey, currentSessionId);
   replyRunState.activeKeysBySessionId.set(currentSessionId, sessionKey);
   registerWaitSessionId(sessionKey, currentSessionId);
-  markReplyRunDiagnosticWorkStarted({ sessionKey, sessionId: currentSessionId });
+  markReplyRunDiagnosticProgress({
+    sessionKey,
+    sessionId: currentSessionId,
+    reason: "reply_operation:queued",
+  });
   if (upstreamAbortSignal) {
     operationsByUpstreamAbortSignal.set(upstreamAbortSignal, operation);
     const abortFromUpstream = () => {
@@ -705,7 +746,10 @@ export function createReplyOperation(params: {
       abortWithReason(restart ? "restart" : "user_abort", upstreamAbortSignal.reason, {
         abortedCode: restart ? "aborted_for_restart" : "aborted_by_user",
       });
-      if (phaseBeforeAbort === "queued" && !retainStateUntilCompleteOperations.has(operation)) {
+      if (
+        isReplyOperationPreBackendPhase(phaseBeforeAbort) &&
+        !retainStateUntilCompleteOperations.has(operation)
+      ) {
         clearState();
       }
     };
@@ -821,11 +865,17 @@ export function isReplyRunActiveForSessionId(sessionId: string): boolean {
   return resolveReplyRunForCurrentSessionId(sessionId) !== undefined;
 }
 
+export function resolveReplyRunPhaseForSessionId(
+  sessionId: string,
+): ReplyOperationPhase | undefined {
+  return resolveReplyRunForCurrentSessionId(sessionId)?.phase;
+}
+
 export function isReplyRunAbortableForCompaction(sessionId: string): boolean {
   const operation = resolveReplyRunForCurrentSessionId(sessionId);
   // Manual compaction uses this as a coordination gate: a finalizing run still
   // needs to drain even when its frozen outcome rejects the abort itself.
-  return Boolean(operation && operation.phase !== "queued");
+  return Boolean(operation && !isReplyOperationPreBackendPhase(operation.phase));
 }
 
 export function isReplyRunStreamingForSessionId(sessionId: string): boolean {
@@ -873,7 +923,7 @@ export function forceClearReplyRunBySessionId(sessionId: string, cause?: unknown
 
 export function clearReplyRunForResetBySessionId(sessionId: string): void {
   const operation = resolveReplyRunForCurrentSessionId(sessionId);
-  if (!operation || operation.phase === "queued") {
+  if (!operation || isReplyOperationPreBackendPhase(operation.phase)) {
     return;
   }
   operation.abortForRestart();
@@ -987,7 +1037,11 @@ export function listActiveReplyRunSessionKeys(): string[] {
 export const testing = {
   resetReplyRunRegistry(): void {
     for (const [sessionKey, sessionId] of replyRunState.activeSessionIdsByKey) {
-      markReplyRunDiagnosticWorkEnded({ sessionKey, sessionId });
+      markReplyRunDiagnosticProgress({
+        sessionKey,
+        sessionId,
+        reason: "reply_operation:registry_reset",
+      });
     }
     replyRunState.activeRunsByKey.clear();
     replyRunState.activeSessionIdsByKey.clear();

@@ -120,6 +120,8 @@ function createReplyOperation(): ReplyOperation {
     phase: "queued",
     result: null,
     setPhase: vi.fn(),
+    markWaitingForDeferredMaintenance: vi.fn(),
+    markDeferredMaintenanceWaitEnded: vi.fn(),
     updateSessionId: vi.fn(),
     hasOwnedSessionId: vi.fn(() => false),
     attachBackend: vi.fn(),
